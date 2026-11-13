@@ -385,12 +385,12 @@ def sparsification_curve(err: np.ndarray, score: np.ndarray):
 
 def aurc_from_curve(coverage: np.ndarray, risk: np.ndarray) -> float:
     # integrate risk over coverage in [0,1]
-    return float(np.trapz(risk, coverage))
+    return float(np.trapezoid(risk, coverage))
 
 
 def ause_from_curves(removed: np.ndarray, risk_method: np.ndarray, risk_oracle: np.ndarray) -> float:
     # integrate (method - oracle) over removed fraction
-    return float(np.trapz(risk_method - risk_oracle, removed))
+    return float(np.trapezoid(risk_method - risk_oracle, removed))
 
 
 def spearmanr_sampled(err: np.ndarray, unc: np.ndarray, max_points=200000, rng: Optional[np.random.RandomState] = None) -> float:

@@ -79,6 +79,9 @@ def get_scene_id(view1, view2, idx):
 def get_scene_id_from_dataset(dataset, idx):
     # Fast path for datasets exposing pairs/sceneids (e.g., ScanNetpp).
     try:
+        # Waymo-format datasets: pairs[idx] = (scene_idx, img1, img2) indexing into scenes.
+        if hasattr(dataset, "pairs") and hasattr(dataset, "scenes") and not hasattr(dataset, "sceneids"):
+            return str(dataset.scenes[int(dataset.pairs[idx][0])])
         if hasattr(dataset, "pairs") and hasattr(dataset, "sceneids"):
             pair = dataset.pairs[idx]
             if isinstance(pair, (list, tuple, np.ndarray)) and len(pair) > 0:
@@ -202,8 +205,8 @@ class HistRC:
         risk_u_g = np.interp(grid, cov_u, risk_u)
         risk_e_g = np.interp(grid, cov_e, risk_e)
 
-        aurc = float(np.trapz(risk_u_g, grid))
-        ause = float(np.trapz(risk_u_g - risk_e_g, grid))
+        aurc = float(np.trapezoid(risk_u_g, grid))
+        ause = float(np.trapezoid(risk_u_g - risk_e_g, grid))
         return aurc, ause, (grid, risk_u_g, risk_e_g)
 
 
@@ -309,6 +312,8 @@ def main():
 
     # settings
     ap.add_argument("--max_pairs", type=int, default=None)
+    ap.add_argument("--pair_stride", type=int, default=1,
+                    help="Keep every N-th pair (applied before scene_fraction / max_pairs).")
     ap.add_argument("--scene_fraction", type=float, default=1.0)
     ap.add_argument("--subset_seed", type=int, default=0)
     ap.add_argument("--mc_samples", type=int, default=16)
@@ -320,8 +325,6 @@ def main():
     ap.set_defaults(sim3_align=True)
     ap.add_argument("--nll_no_sim3", type=int, default=1, choices=[0, 1],
                     help="When 1 (default), NLL ignores Sim3 even if --sim3_align is set.")
-    ap.add_argument("--no_gr_post_smooth", action="store_true",
-                    help="Run the gated residual without its post-smoothing (the setting of paper Table 7).")
 
     # NLL
     ap.add_argument("--do_nll", action="store_true")
@@ -536,6 +539,9 @@ def main():
         all_scenes = set()
         missing_scene = False
         idx_iter = range(L) if L is not None else range(max_pairs)
+        if args.pair_stride > 1:
+            idx_iter = idx_iter[::args.pair_stride]
+            print(f"[SUBSET] pair_stride={args.pair_stride}")
         for idx in idx_iter:
             scene_id = get_scene_id_from_dataset(dataset, idx)
             if scene_id is None:
@@ -593,6 +599,7 @@ def main():
             "scenes_used": scenes_used,
             "scene_fraction": args.scene_fraction,
             "max_pairs": args.max_pairs,
+            "pair_stride": args.pair_stride,
             "pair_indices_used": kept_indices,
             "scene_ids_used": sorted(kept_scenes),
         })
@@ -634,10 +641,6 @@ def main():
             else:
                 st = load_state_dict(ckpt, device="cpu")
                 model.load_state_dict(st, strict=False)
-
-            if args.no_gr_post_smooth:
-                for head in (model.downstream_head1, model.downstream_head2):
-                    head.gr_post_smooth = False
 
             model.eval()
 

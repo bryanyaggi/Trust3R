@@ -112,6 +112,13 @@ def get_args_parser():
         help="If set, freeze backbone + geometry heads and only train the UQ head(s).",
     )
     parser.add_argument(
+        "--freeze_gr",
+        action="store_true",
+        default=False,
+        help="With --freeze_geom_for_uq: keep the gated residual (gate_mlp, delta_mlp, post layers) frozen, "
+             "so only the xyz UQ head trains and the pointmap stays exactly as loaded.",
+    )
+    parser.add_argument(
         "--gr_residual_mode",
         type=str,
         default="pixel_shuffle",
@@ -403,7 +410,7 @@ def train(args):
                     module.requires_grad_(True)
                     unfrozen = True
 
-            if getattr(head, "use_residual_gated", False):
+            if getattr(head, "use_residual_gated", False) and not getattr(args, "freeze_gr", False):
                 if _head_uses_learned_gate(head) and hasattr(head, "gate_mlp") and head.gate_mlp is not None:
                     head.gate_mlp.requires_grad_(True)
                     unfrozen = True
