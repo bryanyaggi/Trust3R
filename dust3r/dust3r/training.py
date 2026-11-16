@@ -119,6 +119,14 @@ def get_args_parser():
              "so only the xyz UQ head trains and the pointmap stays exactly as loaded.",
     )
     parser.add_argument(
+        "--freeze_niw_head",
+        action="store_true",
+        default=False,
+        help="With --freeze_geom_for_uq: keep the NIW head (head_xyz_niw / dpt_xyz_niw) frozen. "
+             "With --freeze_gr as well, only xyz UQ modules other than the NIW head train "
+             "(e.g. a refinement on top of a frozen NIW head); fails if there are none.",
+    )
+    parser.add_argument(
         "--gr_residual_mode",
         type=str,
         default="pixel_shuffle",
@@ -391,7 +399,8 @@ def train(args):
                 unfrozen = True
         return unfrozen
 
-    XYZ_UQ_ATTRS = ("head_xyz_evi", "dpt_xyz_evi", "head_xyz_niw", "dpt_xyz_niw")
+    XYZ_UQ_ATTRS = ("head_xyz_evi", "dpt_xyz_evi", "head_xyz_niw", "dpt_xyz_niw", "niw_refine")
+    NIW_HEAD_ATTRS = ("head_xyz_niw", "dpt_xyz_niw")  # kept frozen by --freeze_niw_head
 
     def _head_uses_learned_gate(head):
         return getattr(head, "gr_gate_mode", "learned") == "learned"
@@ -405,6 +414,8 @@ def train(args):
                 continue
 
             for attr in XYZ_UQ_ATTRS:
+                if getattr(args, "freeze_niw_head", False) and attr in NIW_HEAD_ATTRS:
+                    continue
                 module = getattr(head, attr, None)
                 if module is not None:
                     module.requires_grad_(True)
@@ -591,7 +602,9 @@ def train(args):
                 unfrozen = _unfreeze_xyz_gamma(model_to_freeze) or unfrozen
 
         if not unfrozen:
-            raise RuntimeError("No UQ head found to unfreeze with the requested configuration.")
+            hint = (" (--freeze_niw_head with --freeze_gr leaves nothing to train unless the head has another xyz UQ "
+                    "module, e.g. a refinement)") if getattr(args, "freeze_niw_head", False) else ""
+            raise RuntimeError("No UQ head found to unfreeze with the requested configuration." + hint)
 
     print(f'>> Creating train criterion = {args.train_criterion}')
     train_criterion = eval(args.train_criterion).to(device)
@@ -696,10 +709,14 @@ def train(args):
                     assert any(xyz_evi_flags_old), "[UQ] head_xyz_evi parameters are all frozen"
                 if xyz_evi_flags_dpt:
                     assert any(xyz_evi_flags_dpt), "[UQ] dpt_xyz_evi parameters are all frozen"
-                if xyz_niw_flags_old:
-                    assert any(xyz_niw_flags_old), "[UQ] head_xyz_niw parameters are all frozen"
-                if xyz_niw_flags_dpt:
-                    assert any(xyz_niw_flags_dpt), "[UQ] dpt_xyz_niw parameters are all frozen"
+                if getattr(args, "freeze_niw_head", False):
+                    for flags, attr in ((xyz_niw_flags_old, "head_xyz_niw"), (xyz_niw_flags_dpt, "dpt_xyz_niw")):
+                        assert not any(flags), f"[UQ] {attr} has trainable parameters despite --freeze_niw_head"
+                else:
+                    if xyz_niw_flags_old:
+                        assert any(xyz_niw_flags_old), "[UQ] head_xyz_niw parameters are all frozen"
+                    if xyz_niw_flags_dpt:
+                        assert any(xyz_niw_flags_dpt), "[UQ] dpt_xyz_niw parameters are all frozen"
 
                 print(f"[UQ] head_xyz_evi trainable flags: {xyz_evi_flags_old}")
                 print(f"[UQ] dpt_xyz_evi trainable flags: {xyz_evi_flags_dpt}")

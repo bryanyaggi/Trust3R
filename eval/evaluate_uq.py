@@ -312,6 +312,9 @@ def main():
 
     # settings
     ap.add_argument("--max_pairs", type=int, default=None)
+    ap.add_argument("--col_window", type=str, default="",
+                    help="A:B keeps only GT pixels in image columns [A, B) for every metric (e.g. 96:416 = the "
+                         "central 320x320 window of a 512x320 frame, the field of view of the 224 centre crop).")
     ap.add_argument("--pair_stride", type=int, default=1,
                     help="Keep every N-th pair (applied before scene_fraction / max_pairs).")
     ap.add_argument("--scene_fraction", type=float, default=1.0)
@@ -325,6 +328,9 @@ def main():
     ap.set_defaults(sim3_align=True)
     ap.add_argument("--nll_no_sim3", type=int, default=1, choices=[0, 1],
                     help="When 1 (default), NLL ignores Sim3 even if --sim3_align is set.")
+    ap.add_argument("--gr_post_smooth", action="store_true",
+                    help="Apply the post-smoothing stored in the released checkpoints (paper Tables 1-2). "
+                         "Off by default: the released inference path (Table 7).")
 
     # NLL
     ap.add_argument("--do_nll", action="store_true")
@@ -417,6 +423,11 @@ def main():
         return expr
 
     def derive_model(expr: str, head_type: str) -> str:
+        # Keep the expression's own head_type when it is already this head (it may carry options such as
+        # niw_order="zxy" after a ':'); only swap in a different head.
+        m_ht = re.search(r"head_type=(['\"])(.*?)\1\s*[,)]", expr)
+        if m_ht and m_ht.group(2).split(":", 1)[0] == head_type:
+            return expr
         out = replace_head_type(expr, head_type)
         if out == expr and "head_type=" not in expr:
             print(f"[MODEL] WARNING: cannot override head_type; using base expr for {head_type}.")
@@ -642,6 +653,11 @@ def main():
                 st = load_state_dict(ckpt, device="cpu")
                 model.load_state_dict(st, strict=False)
 
+            if args.gr_post_smooth:
+                for head in (model.downstream_head1, model.downstream_head2):
+                    if getattr(getattr(head, "residual_gated", None), "gate_post", None) is not None:
+                        head.gr_post_smooth = head.use_gr_post_smooth = True
+
             model.eval()
 
             mae_list, rmse_list = [], []
@@ -681,6 +697,11 @@ def main():
                     mask = get_valid_mask(b1)
                     if mask is not None:
                         mask = resize_mask_to_hw(mask, (H, W))
+                        if args.col_window:
+                            c0, c1 = (int(v) for v in args.col_window.split(":"))
+                            keep = torch.zeros_like(mask)
+                            keep[..., c0:c1] = True
+                            mask = mask & keep
 
                     outs = extract_method_outputs(
                         model=model,
@@ -804,7 +825,7 @@ def main():
                                 if use_sim3_nll and sim3 is not None:
                                     m = apply_sim3(m, sim3[0], sim3[1], sim3[2])
                                     Lp = Lp * abs(sim3[0])
-                                nll = niw_nll_3d(gt, m, kappa, nu_p, Lp, mask)
+                                nll = niw_nll_3d(gt, m, kappa, nu_p, Lp, mask, order=outs.extra.get("order", "xyz"))
                                 nll_list.append(nll)
                             else:
                                 var = outs.extra.get("var_diag", None)

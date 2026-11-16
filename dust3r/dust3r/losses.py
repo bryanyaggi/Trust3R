@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from dust3r.inference import get_pred_pts3d, find_opt_scaling
-from dust3r.utils.geometry import inv, geotrf, normalize_pointcloud
+from dust3r.utils.geometry import inv, geotrf, geotrf_gt, normalize_pointcloud
 from dust3r.utils.geometry import get_joint_pointcloud_depth, get_joint_pointcloud_center_scale
 
 
@@ -158,8 +158,8 @@ class Regr3D (Criterion, MultiLoss):
     def get_all_pts3d(self, gt1, gt2, pred1, pred2, dist_clip=None):
         # everything is normalized w.r.t. camera of view1
         in_camera1 = inv(gt1['camera_pose'])
-        gt_pts1 = geotrf(in_camera1, gt1['pts3d'])  # B,H,W,3
-        gt_pts2 = geotrf(in_camera1, gt2['pts3d'])  # B,H,W,3
+        gt_pts1 = geotrf_gt(in_camera1, gt1['pts3d'])  # B,H,W,3 (float64: exact GT on any GPU)
+        gt_pts2 = geotrf_gt(in_camera1, gt2['pts3d'])  # B,H,W,3
 
         valid1 = gt1['valid_mask'].clone()
         valid2 = gt2['valid_mask'].clone()

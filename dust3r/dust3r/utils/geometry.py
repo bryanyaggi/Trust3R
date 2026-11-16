@@ -37,6 +37,20 @@ def xy_grid(W, H, device=None, origin=(0, 0), unsqueeze=None, cat_dim=-1, homoge
     return grid
 
 
+def geotrf_gt(Trf, pts):
+    """geotrf for ground truth: computed in float64 and cast back to pts' dtype.
+
+    RELLIS-3D world coordinates reach ~250 m, and with TF32 enabled (training.py, croco.py) a float32 einsum on an
+    Ada GPU (RTX 6000 Ada) loses ~1e-3 relative: a median 3.5 cm (max 10 cm) GT error in camera coordinates, enough
+    to move NIW NLL by 0.4-1.9 because Psi is nearly rank 1 with cm-scale lateral spread. (On the RTX A4500 the same
+    call is exact.) GT must not depend on the GPU, so it is transformed in float64.
+    """
+    if isinstance(Trf, torch.Tensor):
+        out_dtype = pts.dtype if isinstance(pts, torch.Tensor) else Trf.dtype
+        return geotrf(Trf.double(), torch.as_tensor(pts, device=Trf.device).double()).to(out_dtype)
+    return geotrf(Trf, pts)
+
+
 def geotrf(Trf, pts, ncol=None, norm=False):
     """ Apply a geometric transformation to a list of 3-D points.
 

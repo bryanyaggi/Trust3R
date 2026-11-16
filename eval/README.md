@@ -163,9 +163,11 @@ Details that change the numbers if you deviate from them.
   reproduce regardless of the method list; ρ only reproduces under the full run.
 
 - **Post-smoothing.** The released checkpoints carry the post-smoothing of the
-  gated residual (App. A.3). It is rebuilt and applied when they are loaded, which
-  is what Tables 1, 2, 5 and 6 use. `--no_gr_post_smooth` evaluates without it:
-  that is the setting of Table 7, whose ★ rows are the `ours_niw_total` rows.
+  gated residual (App. A.3). It is rebuilt when they are loaded, so its weights
+  load, but it is off by default: that is the released inference path and the
+  setting of Table 7, whose ★ rows are the `ours_niw_total` rows.
+  `--gr_post_smooth` applies it, which is what Tables 1, 2, 5 and 6 use;
+  `reproduce_table1_table2.sh` passes it. In training, `--gr_post_smooth` decides.
 
 - **Gated-residual settings are read from the model expression**, not from the
   checkpoint's training args. `reproduce_table1_table2.sh` passes the expression

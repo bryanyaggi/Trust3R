@@ -72,6 +72,7 @@ echo "[Trust3R] out_dir        = $OUT_DIR"
   --sim3_align \
   --do_nll \
   --nll_no_sim3 1 \
+  --gr_post_smooth \
   --out_dir "$OUT_DIR"
 
 echo

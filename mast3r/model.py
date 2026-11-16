@@ -51,7 +51,8 @@ class AsymmetricMASt3R(AsymmetricCroCo3DStereo):
             return super(AsymmetricMASt3R, cls).from_pretrained(pretrained_model_name_or_path, **kw)
 
     def load_state_dict(self, ckpt, **kw):
-        # the released checkpoints were trained with a two-layer post-smoothing: rebuild it so that it loads
+        # the released checkpoints were trained with a two-layer post-smoothing: rebuild it so that it loads,
+        # without switching it on (off unless the head was configured with it; evaluate_uq.py --gr_post_smooth)
         # shortcut: the modules are replaced on every such load, so `--resume` from one of these checkpoints
         # leaves the optimizer with the old parameters; rebuild only once if that use case appears
         if any(k.endswith('residual_gated.delta_post.0.weight') for k in ckpt):

@@ -9,7 +9,7 @@ import tqdm
 import torch
 from dust3r.utils.device import to_cpu, collate_with_cat
 from dust3r.utils.misc import invalid_to_nans
-from dust3r.utils.geometry import depthmap_to_pts3d, geotrf, inv
+from dust3r.utils.geometry import depthmap_to_pts3d, geotrf, geotrf_gt, inv
 from mast3r.losses_evidential import (
     evidential_nig_loss,
     predictive_mean_var,
@@ -55,9 +55,9 @@ def _get_gt_xyz(view1, view2, device):
     pts2 = pts2.to(device, non_blocking=True)
     cam1 = cam1.to(device, non_blocking=True)
 
-    world_to_cam1 = inv(cam1)
-    gt_xyz1 = geotrf(world_to_cam1, pts1)
-    gt_xyz2 = geotrf(world_to_cam1, pts2)
+    world_to_cam1 = inv(cam1.double())  # float64: exact GT on any GPU (see geotrf_gt)
+    gt_xyz1 = geotrf_gt(world_to_cam1, pts1)
+    gt_xyz2 = geotrf_gt(world_to_cam1, pts2)
 
     if gt_xyz1.ndim == 4 and gt_xyz1.shape[-1] == 3:
         gt_xyz1 = gt_xyz1.permute(0, 3, 1, 2)
@@ -372,11 +372,11 @@ def _compute_uq_loss(view1, view2, pred1, pred2, args):
 
                 loss_xyz1, stats_xyz1 = evidential_niw_loss_3d(
                     y_xyz1, m1_xyz, kappa1_xyz, nu1_xyz, L1_xyz,
-                    mask=valid1, lambda_evi=lam_evi_xyz,
+                    mask=valid1, lambda_evi=lam_evi_xyz, order=pred1.get("xyz_niw_order", "xyz"),
                 )
                 loss_xyz2, stats_xyz2 = evidential_niw_loss_3d(
                     y_xyz2, m2_xyz, kappa2_xyz, nu2_xyz, L2_xyz,
-                    mask=valid2, lambda_evi=lam_evi_xyz,
+                    mask=valid2, lambda_evi=lam_evi_xyz, order=pred2.get("xyz_niw_order", "xyz"),
                 )
                 losses["loss_uq_xyz"] = 0.5 * (loss_xyz1 + loss_xyz2)
                 stats.update({

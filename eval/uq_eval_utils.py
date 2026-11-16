@@ -147,12 +147,13 @@ def compute_gt_xyz_cam(v1: Dict) -> torch.Tensor:
         cam_pose = torch.as_tensor(cam_pose, device=pts.device, dtype=pts.dtype)
     if cam_pose.ndim == 2:
         cam_pose = cam_pose.unsqueeze(0)
-    # pts3d seems in world; convert world->cam
-    world_to_cam = torch.linalg.inv(cam_pose)
+    # pts3d seems in world; convert world->cam. In float64: with TF32 on, a float32 einsum on an Ada GPU puts a
+    # median 3.5 cm error into RELLIS GT (world coordinates up to ~250 m), which shifts NIW NLL by 0.4-1.9.
+    world_to_cam = torch.linalg.inv(cam_pose.double())
     r = world_to_cam[:, :3, :3]
     t = world_to_cam[:, :3, 3]
-    pts_cam = torch.einsum("bij,bjhw->bihw", r, pts) + t[:, :, None, None]
-    return pts_cam
+    pts_cam = torch.einsum("bij,bjhw->bihw", r, pts.double()) + t[:, :, None, None]
+    return pts_cam.to(pts.dtype)
 
 
 def resize_to_hw(x: torch.Tensor, hw: Tuple[int, int], mode="bilinear") -> torch.Tensor:
@@ -541,18 +542,24 @@ def nig_nll_3d(y_xyz, gamma, nu, alpha, beta, mask_bhw: Optional[torch.Tensor], 
     return float(nll.mean().detach().cpu())
 
 
-def niw_nll_3d(y_xyz, m_xyz, kappa, nu, Lp, mask_bhw: Optional[torch.Tensor], eps=1e-8) -> float:
+def niw_nll_3d(y_xyz, m_xyz, kappa, nu, Lp, mask_bhw: Optional[torch.Tensor], eps=1e-8, order="xyz") -> float:
     """
     Multivariate Student-t NLL induced by NIW.
     y_xyz,m_xyz: [B,3,H,W]
     kappa,nu: [B,1,H,W]
     Lp: [B,6,H,W] with order [l00,l10,l11,l20,l21,l22]
+    order: coordinate order of the factor ("xyz", or "zxy" for the sign-consistent head); for "zxy" the
+    residual is permuted to (z, x, y), which leaves the NLL of Psi in xyz unchanged.
     """
     B, C, H, W = y_xyz.shape
     d = 3
     y = y_xyz.permute(0, 2, 3, 1).reshape(-1, d)
     m = m_xyz.permute(0, 2, 3, 1).reshape(-1, d)
     diff = (y - m).unsqueeze(-1)  # [N,3,1]
+    if order == "zxy":
+        diff = diff[:, [2, 0, 1]]
+    elif order != "xyz":
+        raise ValueError(f"unknown NIW order {order!r}")
 
     Lp_flat = Lp.permute(0, 2, 3, 1).reshape(-1, 6)
     l00 = Lp_flat[:, 0].clamp_min(eps)
@@ -909,7 +916,8 @@ def extract_method_outputs(
             else:
                 raise ValueError(f"NIW Lp shape unexpected: {tuple(Lp.shape)}")
             Lp = resize_to_hw(Lp, (H, W), "bilinear")
-            extra = {"m": m, "kappa": kappa, "nu": nu, "Lp": Lp}
+            order = pred1.get("xyz_niw_order", "xyz")
+            extra = {"m": m, "kappa": kappa, "nu": nu, "Lp": Lp, "order": order}
             kappa_c = torch.clamp(kappa, min=1e-8)
             nu_pred = torch.clamp(nu - 2.0, min=1e-8)
             scale_alea = 1.0 / nu_pred
@@ -931,6 +939,8 @@ def extract_method_outputs(
             diag1 = l10 * l10 + l11 * l11
             diag2 = l20 * l20 + l21 * l21 + l22 * l22
             psi_diag = torch.stack([diag0, diag1, diag2], dim=1)
+            if order == "zxy":
+                psi_diag = psi_diag[:, [1, 2, 0]]  # (z, x, y) -> (x, y, z); the trace is unchanged
             var_diag = psi_diag * scale
 
         if var_diag is None:

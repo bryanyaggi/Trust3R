@@ -12,7 +12,7 @@ from sklearn.metrics import average_precision_score
 import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.losses import BaseCriterion, Criterion, MultiLoss, Sum, ConfLoss
 from dust3r.losses import Regr3D as Regr3D_dust3r
-from dust3r.utils.geometry import (geotrf, inv, normalize_pointcloud)
+from dust3r.utils.geometry import (geotrf, geotrf_gt, inv, normalize_pointcloud)
 from dust3r.inference import get_pred_pts3d
 from dust3r.utils.geometry import get_joint_pointcloud_depth, get_joint_pointcloud_center_scale
 
@@ -43,8 +43,8 @@ class Regr3D (Regr3D_dust3r):
     def get_all_pts3d(self, gt1, gt2, pred1, pred2, dist_clip=None):
         # everything is normalized w.r.t. camera of view1
         in_camera1 = inv(gt1['camera_pose'])
-        gt_pts1 = geotrf(in_camera1, gt1['pts3d'])  # B,H,W,3
-        gt_pts2 = geotrf(in_camera1, gt2['pts3d'])  # B,H,W,3
+        gt_pts1 = geotrf_gt(in_camera1, gt1['pts3d'])  # B,H,W,3 (float64: exact GT on any GPU)
+        gt_pts2 = geotrf_gt(in_camera1, gt2['pts3d'])  # B,H,W,3
 
         valid1 = gt1['valid_mask'].clone()
         valid2 = gt2['valid_mask'].clone()

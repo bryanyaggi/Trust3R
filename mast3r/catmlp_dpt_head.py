@@ -169,10 +169,12 @@ def _init_residual_gated_post_modules(module):
             module.residual_gated.delta_post.to(device=ref_param.device, dtype=ref_param.dtype)
 
 
-def use_two_layer_post_smooth(module):
+def use_two_layer_post_smooth(module, enable=None):
     """Post-smoothing of the released checkpoints (App. A.3; paper Tables 1-2): a 3x3 conv on the gate
     logits and a depthwise-separable conv on the residual, applied directly rather than as residual updates.
-    Turns smoothing on; set `gr_post_smooth = False` on the head afterwards for the setting of Table 7.
+    Rebuilds the modules so that the released weights load. `enable=None` keeps the head's `gr_post_smooth`
+    (off unless configured, e.g. by training's --gr_post_smooth): the released inference path, Table 7.
+    `enable=True` turns it on (Tables 1-2).
     """
     gate_channels = int(getattr(module, "gr_gate_channels", 1))
     post = module.residual_gated
@@ -183,7 +185,9 @@ def use_two_layer_post_smooth(module):
     )
     post.to(module.gate_mlp.fc1.weight.device)
     module.gr_post_direct = True
-    module.gr_post_smooth = module.use_gr_post_smooth = True
+    if enable is None:
+        enable = bool(getattr(module, "gr_post_smooth", False))
+    module.gr_post_smooth = module.use_gr_post_smooth = bool(enable)
 
 
 def _configure_residual_gated_modules(
@@ -433,6 +437,8 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d(PixelwiseTaskWithDPT):
         return x
 
     def _mc_dropout_hook(self, module, inputs, output):
+        if isinstance(output, tuple):  # dpt(..., return_feature=True): (out, path_1); drop out on the output only
+            return (self._apply_mc_dropout(output[0]),) + tuple(output[1:])
         return self._apply_mc_dropout(output)
 
     def forward(self, decout, img_shape):
@@ -745,6 +751,54 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZEviDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         return out
 
 
+# Pivot orders for the NIW Cholesky factor: index lists that take xyz-ordered channels to zxy and back.
+NIW_XYZ_TO_ZXY = (2, 0, 1)
+NIW_ZXY_TO_XYZ = (1, 2, 0)
+
+
+class NIWRefine(nn.Module):
+    """Guided refinement of the NIW parameters ("B" in docs/finetune_plan.md, Phase 3).
+
+    Reads the NIW head's 8 raw channels and the geometry DPT's penultimate features (last_dim channels at H x W,
+    after the head's ReLU: the features MASt3R's pts3d and conf are a 1x1 readout of) and predicts per-pixel
+    corrections (d_kappa, d_nu, d_s), applied as raw kappa += d_kappa, raw nu += d_nu, L' *= exp(d_s).
+    A positive scale on L' changes the size of Psi, never its orientation or signs. d_s is bounded to
+    +-max_log_scale with a tanh. The output conv is zero-initialised, so a freshly added refinement reproduces the
+    head exactly. Replicate padding: zero padding gives a position cue near the borders (the seam mechanism).
+    Inputs are standardised per channel with fixed statistics taken from the first training batch (data-dependent
+    init, as ActNorm), because their scales differ by ~1000x (feature std 0.008-8, raw nu ~11); the statistics are
+    buffers, so they are saved with the checkpoint, and eval before any training leaves them at identity.
+    """
+
+    def __init__(self, feat_dim=128, proj_dim=32, hidden_dim=64, depth=3, max_log_scale=3.0):
+        super().__init__()
+        self.max_log_scale = float(max_log_scale)
+        self.register_buffer("in_mean", torch.zeros(8 + feat_dim))
+        self.register_buffer("in_std", torch.ones(8 + feat_dim))
+        self.register_buffer("in_ready", torch.zeros((), dtype=torch.bool))
+        self.proj = nn.Conv2d(feat_dim, proj_dim, kernel_size=1)
+        layers, c = [], 8 + proj_dim
+        for _ in range(depth):
+            layers += [nn.Conv2d(c, hidden_dim, kernel_size=3, padding=1, padding_mode="replicate"), nn.ReLU(True)]
+            c = hidden_dim
+        self.body = nn.Sequential(*layers)
+        self.out = nn.Conv2d(c, 3, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, niw_raw, geo_feat):
+        x = torch.cat([niw_raw, geo_feat], dim=1)
+        if self.training and not bool(self.in_ready):
+            with torch.no_grad():
+                self.in_mean.copy_(x.mean(dim=(0, 2, 3)))
+                self.in_std.copy_(x.std(dim=(0, 2, 3)).clamp_min(1e-3))
+                self.in_ready.fill_(True)
+        x = (x - self.in_mean[:, None, None]) / self.in_std[:, None, None]
+        d = self.out(self.body(torch.cat([x[:, :8], self.proj(x[:, 8:])], dim=1)))
+        d_s = self.max_log_scale * torch.tanh(d[:, 2:3] / self.max_log_scale)
+        return d[:, 0:1], d[:, 1:2], d_s
+
+
 class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d):
     """
     Hybrid head:
@@ -752,6 +806,21 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
       - local desc head stays as the original MLP (pretrained-compatible)
       - add a parallel heavy NIW head with SAME DPT architecture as pts3d head
         output 8 channels = (kappa, nu, L_params) where L_params are 6 lower-tri entries
+
+    niw_order selects the coordinate order of the Cholesky factor (docs/seam_mechanism.md, section 6):
+      - "xyz" (released): L L^T = Psi.
+      - "zxy" (sign-consistent): L' L'^T = P Psi P^T with P (x, y, z) = (z, x, y). The pivot is z, which is
+        positive in front of the camera, so the first column never has to flip sign at the centre column.
+    xyz_niw_L / xyz_niw_Lp hold the 6 entries in the head's own order and xyz_niw_order names it; consumers
+    permute the residual instead of converting back. xyz_niw_Lmat is always a square root of Psi in xyz
+    (lower-triangular only for "xyz"); the per-axis outputs are always in xyz.
+    Select it with head_type='catmlp+dpt+xyz_niw_dpt+residual_gated:niw_order="zxy"'.
+
+    niw_refine="feat" adds NIWRefine (self.niw_refine) on top of the NIW head, fed with the geometry DPT's
+    penultimate features; it is trained as an xyz UQ module (training.py XYZ_UQ_ATTRS) and can be trained alone
+    with --freeze_niw_head --freeze_gr. Checkpoints without it load with only niw_refine.* missing, and then
+    reproduce the head exactly (zero-initialised output conv). Combine options with a comma:
+    head_type='catmlp+dpt+xyz_niw_dpt+residual_gated:niw_order="zxy",niw_refine="feat"'.
     """
 
     def __init__(
@@ -761,8 +830,12 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         local_feat_dim=16,
         hidden_dim_factor=4.0,
         residual_gated=False,
+        niw_order="xyz",
+        niw_refine=None,
         **kwargs,
     ):
+        assert niw_order in ("xyz", "zxy"), niw_order
+        assert niw_refine in (None, "feat"), niw_refine
         super().__init__(
             net,
             has_conf=has_conf,
@@ -773,6 +846,7 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         )
         self.eps = 1e-6
         self.detach_xyz_niw_m = True
+        self.niw_order = niw_order
 
         # Match create_dpt_head(net) hyperparams exactly
         assert net.dec_depth > 9
@@ -798,11 +872,27 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
             nn.init.zeros_(self.dpt_xyz_niw.head.weight)
             nn.init.zeros_(self.dpt_xyz_niw.head.bias)
 
+        self.niw_refine = None
+        if niw_refine == "feat":
+            # geometry DPT head = [3x3 conv, x2 upsample, 3x3 conv, ReLU, 1x1 readout]; the tap is the ReLU output
+            assert isinstance(self.dpt.head, nn.Sequential) and isinstance(self.dpt.head[3], nn.ReLU), self.dpt.head
+            self.niw_refine = NIWRefine(feat_dim=self.dpt.head[4].in_channels)
+
+    def _geometry_features(self, path_1):
+        """Penultimate features of the (frozen) geometry DPT, detached: what pts3d and conf are read out from."""
+        with torch.no_grad():
+            return self.dpt.head[:4](path_1)
+
     def forward(self, decout, img_shape):
         H, W = img_shape
 
         # 1) heavy geometry prediction (pretrained)
-        pts3d = self.dpt(decout, image_size=(H, W))  # B, (3+conf), H, W
+        geo_feat = None
+        if self.niw_refine is not None:
+            pts3d, path_1 = self.dpt(decout, image_size=(H, W), return_feature=True)
+            geo_feat = self._geometry_features(path_1)
+        else:
+            pts3d = self.dpt(decout, image_size=(H, W))  # B, (3+conf), H, W
 
         # 2) concat encoder+decoder tokens
         enc_output, dec_output = decout[0], decout[-1]
@@ -834,6 +924,11 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         raw_kappa = xyz_niw_raw[:, 0:1]
         raw_nu = xyz_niw_raw[:, 1:2]
         raw_L = xyz_niw_raw[:, 2:8]
+        refine = None
+        if self.niw_refine is not None:
+            d_kappa, d_nu, d_s = self.niw_refine(xyz_niw_raw, geo_feat)
+            raw_kappa, raw_nu = raw_kappa + d_kappa, raw_nu + d_nu
+            refine = torch.cat([d_kappa, d_nu, d_s], dim=1)
 
         kappa = F.softplus(raw_kappa) + self.eps
         nu = 4.0 + F.softplus(raw_nu) + self.eps
@@ -845,6 +940,9 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         l10 = l10_raw
         l20 = l20_raw
         l21 = l21_raw
+        if refine is not None:  # L' *= exp(d_s): rescales Psi by exp(2 d_s), orientation unchanged
+            scale_L = torch.exp(refine[:, 2:3])
+            l00, l10, l11, l20, l21, l22 = (v * scale_L for v in (l00, l10, l11, l20, l21, l22))
         xyz_niw_Lp = torch.cat([l00, l10, l11, l20, l21, l22], dim=1)
         B, _, H_L, W_L = l00.shape
         xyz_niw_Lmat = torch.zeros((B, 3, 3, H_L, W_L), device=l00.device, dtype=l00.dtype)
@@ -854,6 +952,9 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         xyz_niw_Lmat[:, 2, 0] = l20[:, 0]
         xyz_niw_Lmat[:, 2, 1] = l21[:, 0]
         xyz_niw_Lmat[:, 2, 2] = l22[:, 0]
+        if self.niw_order == "zxy":
+            # rows of L' are (z, x, y); P^T L' (rows in x, y, z order) is a square root of Psi
+            xyz_niw_Lmat = xyz_niw_Lmat[:, list(NIW_ZXY_TO_XYZ)]
 
         pts3d_for_m = (out.get("pts3d_refined", None) if isinstance(out, dict) else None)
         if pts3d_for_m is None:
@@ -873,6 +974,8 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
         psi_11 = l10 ** 2 + l11 ** 2 + self.eps
         psi_22 = l20 ** 2 + l21 ** 2 + l22 ** 2 + self.eps
         xyz_niw_psi_diag = torch.cat([psi_00, psi_11, psi_22], dim=1)
+        if self.niw_order == "zxy":
+            xyz_niw_psi_diag = xyz_niw_psi_diag[:, list(NIW_ZXY_TO_XYZ)]  # (z, x, y) -> (x, y, z)
         xyz_niw_var_diag = xyz_niw_psi_diag * scale
 
         if not isinstance(out, dict):
@@ -884,6 +987,7 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
                 "xyz_niw_nu": nu,
                 "xyz_niw_L": xyz_niw_Lp,
                 "xyz_niw_Lp": xyz_niw_Lp,
+                "xyz_niw_order": self.niw_order,
                 "xyz_niw_Lmat": xyz_niw_Lmat,
                 "xyz_niw_psi_diag": xyz_niw_psi_diag,
                 "xyz_niw_scale": scale,
@@ -892,6 +996,8 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d_XYZNIWDPT(Cat_MLP_LocalFeatures_DPT_Pts3d)
                 "xyz_var": xyz_niw_var_diag,
             }
         )
+        if refine is not None:
+            out["xyz_niw_refine"] = refine  # (d_kappa, d_nu, d_s) per pixel, for diagnostics
         return out
 
 

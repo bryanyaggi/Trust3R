@@ -1,7 +1,8 @@
 """The released checkpoints carry a two-layer post-smoothing in the gated-residual branch (App. A.3).
 
-Loading such a checkpoint has to rebuild that module and apply it the way it was trained; switching
-`gr_post_smooth` off afterwards gives the refinement without smoothing (the setting of Table 7).
+Loading such a checkpoint has to rebuild that module so that its weights load, but leave it off unless the
+head was configured with it: off is the released inference path (Table 7). Switching `gr_post_smooth` on
+afterwards applies it the way it was trained (Tables 1-2; evaluate_uq.py --gr_post_smooth).
 Run with: python -m pytest tests/
 """
 import os
@@ -66,15 +67,16 @@ def loaded():
     net = tiny_model()
     sd = released_layout_state_dict(net)
     result = net.load_state_dict(sd, strict=False)
+    by_default = predict(net)
+    set_post_smooth(net, True)
     with_smoothing = predict(net)
     set_post_smooth(net, False)
     without_smoothing = predict(net)
-    set_post_smooth(net, True)
-    return sd, result, with_smoothing, without_smoothing
+    return sd, result, with_smoothing, without_smoothing, by_default
 
 
 def test_released_layout_loads_without_leftover_keys(loaded):
-    _, result, _, _ = loaded
+    _, result, _, _, _ = loaded
     assert list(result.missing_keys) == []
     assert list(result.unexpected_keys) == []
 
@@ -86,8 +88,21 @@ def test_released_layout_still_loads_into_a_model_without_gated_residual():
     assert list(result.missing_keys) == []
 
 
+def test_loading_leaves_post_smoothing_off_by_default(loaded):
+    _, _, _, without_smoothing, by_default = loaded
+    assert torch.equal(by_default["pts3d"], without_smoothing["pts3d"])
+
+
+def test_loading_keeps_post_smoothing_a_head_was_configured_with():
+    net = tiny_model()  # e.g. training with --gr_post_smooth 1, configured before --pretrained is loaded
+    set_post_smooth(net, True)
+    net.load_state_dict(released_layout_state_dict(net), strict=False)
+    for head in HEADS:
+        assert getattr(net, head).gr_post_smooth and getattr(net, head).use_gr_post_smooth
+
+
 def test_loaded_post_smoothing_is_applied_directly_to_gate_logits_and_residual(loaded):
-    sd, _, with_smoothing, without_smoothing = loaded
+    sd, _, with_smoothing, without_smoothing, _ = loaded
     logits, delta = without_smoothing["gr_gate_logits"], without_smoothing["gr_delta"]
     gate = torch.sigmoid(F.conv2d(logits, sd[POST + "gate_post.weight"], sd[POST + "gate_post.bias"], padding=1))
     delta = F.conv2d(delta, sd[POST + "delta_post.0.weight"], sd[POST + "delta_post.0.bias"], padding=1, groups=3)
@@ -97,7 +112,7 @@ def test_loaded_post_smoothing_is_applied_directly_to_gate_logits_and_residual(l
 
 
 def test_switching_post_smoothing_off_leaves_the_plain_gated_residual(loaded):
-    _, _, with_smoothing, without_smoothing = loaded
+    _, _, with_smoothing, without_smoothing, _ = loaded
     gate = torch.sigmoid(without_smoothing["gr_gate_logits"])
     expected = without_smoothing["pts3d_raw"] + (gate * without_smoothing["gr_delta"]).permute(0, 2, 3, 1)
     assert torch.allclose(without_smoothing["pts3d"], expected, atol=1e-5)

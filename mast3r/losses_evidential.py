@@ -145,9 +145,13 @@ def evidential_niw_loss_3d(
     mask: Optional[torch.Tensor] = None,
     lambda_evi: float = 1e-3,
     eps: float = 1e-8,
+    order: str = "xyz",
 ):
     """
     3D evidential NIW loss using the predictive multivariate Student-t NLL.
+    order: coordinate order of the Cholesky factor L ("xyz" or "zxy", the head's xyz_niw_order).
+    For "zxy" the residual is permuted to (z, x, y) before the triangular solve; the Mahalanobis
+    distance and log det are invariant under the permutation, so the NLL is that of Psi in xyz.
 
     y_xyz, m_xyz: [B, 3, H, W]
     kappa, nu: [B, 1, H, W]
@@ -166,6 +170,10 @@ def evidential_niw_loss_3d(
     y = y_xyz.permute(0, 2, 3, 1).reshape(-1, d)
     m = m_xyz.permute(0, 2, 3, 1).reshape(-1, d)
     diff = (y - m).unsqueeze(-1)
+    if order == "zxy":
+        diff = diff[:, [2, 0, 1]]
+    elif order != "xyz":
+        raise ValueError(f"unknown NIW order {order!r}")
 
     Lp = L.permute(0, 2, 3, 1).reshape(-1, 6)
     l00 = Lp[:, 0].clamp_min(eps)
