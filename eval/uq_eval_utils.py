@@ -95,6 +95,11 @@ def batchify_view(view: Dict, device: torch.device):
             if t.ndim <= 3:
                 t = t.unsqueeze(0)
             out[k] = t.to(device, non_blocking=True)
+        elif isinstance(v, str):
+            # batch of one, like the tensors. A bare string breaks dust3r's is_symmetrized, which compares
+            # instance[i] per batch element: it would compare characters, and e.g. frames "001189"/"001198" would
+            # pass as a symmetrized pair, so the model encodes view 1 twice and returns a batch of 2.
+            out[k] = [v]
         else:
             out[k] = v
     return out
